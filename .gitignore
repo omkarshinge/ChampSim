@@ -27,3 +27,5 @@ absolute.options
 
 .vscode/
 **/.DS_Store
+
+results/
