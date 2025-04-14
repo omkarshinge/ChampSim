@@ -29,3 +29,4 @@ absolute.options
 **/.DS_Store
 
 results/
+intermediate_logs/
