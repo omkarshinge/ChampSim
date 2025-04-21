@@ -12,6 +12,8 @@ Biswabandan Panda - biswap@cse.iitk.ac.in
 #include "ipcp.h"
 
 #include "cache.h"
+#include <iostream>
+#include <access_type.h>
 
 #define NUM_IP_TABLE_L1_ENTRIES 1024 // IP table entries
 #define NUM_GHB_ENTRIES 16           // Entries in the GHB
@@ -22,13 +24,19 @@ Biswabandan Panda - biswap@cse.iitk.ac.in
 #define CPLX_TYPE 3                  // complex stride
 #define NL_TYPE 4                    // next line
 
-// #define SIG_DEBUG_PRINT
+// #define DEBUG_PRINT
 #ifdef SIG_DEBUG_PRINT
 #define SIG_DP(x) x
 #else
 #define SIG_DP(x)
 #endif
 
+enum IPCP_CLASSES {
+  NL = 1,
+  GS,
+  CS,
+  CPLX
+};
 class IP_TABLE_L1
 {
 public:
@@ -77,7 +85,14 @@ uint64_t ghb_l1[NUM_GHB_ENTRIES];
 uint64_t prev_cpu_cycle;
 uint64_t num_misses;
 float mpkc = {0};
-int spec_nl = {0};
+// int spec_nl = {0};
+
+int pf_cs = 0, pf_nl = 0, pf_gs = 0, pf_cplx = 0;
+int pf_cs_successful = 0, pf_nl_successful = 0, pf_gs_successful = 0, pf_cplx_successful = 0;
+int pf_cs_hit = 0, pf_nl_hit = 0, pf_gs_hit = 0, pf_cplx_hit = 0;
+int pf_cs_fill = 0, pf_nl_fill = 0, pf_gs_fill = 0, pf_cplx_fill = 0, pf_default_fill = 0;
+int pf_cs_lc = 0, pf_nl_lc = 0, pf_gs_lc = 0, pf_cplx_lc = 0;
+
 
 /***************Updating the signature*************************************/
 uint16_t update_sig_l1(uint16_t old_sig, int delta)
@@ -178,19 +193,22 @@ int update_conf(int stride, int pred_stride, int conf)
 uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::address ip, uint8_t cache_hit, bool useful_prefetch, access_type type,
                                         uint32_t metadata_in)
 {
-
+  // if(useful_prefetch){
+  //   std::cout<< "[OPERATE]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Cache hit :" << (int)cache_hit << std::endl;
+  // } 
+  
   uint64_t curr_page = addr.to<uint64_t>() >> LOG2_PAGE_SIZE;
   uint64_t cl_addr = addr.to<uint64_t>() >> LOG2_BLOCK_SIZE;
   uint64_t cl_offset = (addr.to<uint64_t>() >> LOG2_BLOCK_SIZE) & 0x3F;
   uint16_t signature = 0, last_signature = 0;
   int prefetch_degree = 0;
-  int spec_nl_threshold = 0;
+  // int spec_nl_threshold = 0;
   int num_prefs = 0;
   uint32_t metadata = 0;
   uint16_t ip_tag = (ip.to<uint64_t>() >> NUM_IP_INDEX_BITS) & ((1 << NUM_IP_TAG_BITS) - 1);
 
   prefetch_degree = 3;
-  spec_nl_threshold = 15;
+  // spec_nl_threshold = 15;
 
   // update miss counter
   if (cache_hit == 0)
@@ -209,6 +227,8 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
   // calculate the index bit
   int index = ip.to<uint64_t>() & ((1 << NUM_IP_INDEX_BITS) - 1);
+  // std::cout<< "IP Tag :" <<ip_tag << "    index :" << index <<std::endl;
+
   if (trackers_l1[index].ip_tag != ip_tag) { // new/conflict IP
     if (trackers_l1[index].ip_valid == 0) {  // if valid bit is zero, update with latest IP info
       trackers_l1[index].ip_tag = ip_tag;
@@ -227,8 +247,14 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
     // issue a next line prefetch upon encountering new IP
     uint64_t pf_address = ((addr.to<uint64_t>() >> LOG2_BLOCK_SIZE) + 1) << LOG2_BLOCK_SIZE; // BASE NL=1, changing it to 3
-    metadata = encode_metadata(1, NL_TYPE, spec_nl);
-    prefetch_line(champsim::address{pf_address}, true, metadata);
+    // metadata = encode_metadata(1, NL_TYPE, spec_nl);
+    pf_nl_lc++;
+    if(prefetch_line(champsim::address{pf_address}, true, 1)){
+      pf_nl++;
+    } 
+    // else {
+    //   prefetch_line(champsim::address{pf_address}, false, 1);
+    // }
     return metadata_in;
   } else { // if same IP encountered, set valid bit
     trackers_l1[index].ip_valid = 1;
@@ -290,22 +316,29 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
       if (trackers_l1[index].str_dir == 1) { // +ve stream
         pf_address = (cl_addr + i + 1) << LOG2_BLOCK_SIZE;
-        metadata = encode_metadata(1, S_TYPE, spec_nl); // stride is 1
+        // metadata = encode_metadata(1, S_TYPE, spec_nl); // stride is 1
       } else {                                          // -ve stream
         pf_address = (cl_addr - i - 1) << LOG2_BLOCK_SIZE;
-        metadata = encode_metadata(-1, S_TYPE, spec_nl); // stride is -1
+        // metadata = encode_metadata(-1, S_TYPE, spec_nl); // stride is -1
       }
 
       // Check if prefetch address is in same 4 KB page
       if ((pf_address >> LOG2_PAGE_SIZE) != (addr.to<uint64_t>() >> LOG2_PAGE_SIZE)) {
         break;
       }
-      prefetch_line(champsim::address{pf_address}, true, metadata);
+      pf_gs_lc++;
+      if(prefetch_line(champsim::address{pf_address}, true, 2)){
+        pf_gs++;
+      } 
+      // else {
+      //   prefetch_line(champsim::address{pf_address}, false, 2);
+      // }
       num_prefs++;
       SIG_DP(cout << "1, ");
     }
 
-  } else if (trackers_l1[index].conf > 1 && trackers_l1[index].last_stride != 0) { // CS IP
+  } 
+  else if (trackers_l1[index].conf > 1 && trackers_l1[index].last_stride != 0) { // CS IP
     for (int i = 0; i < prefetch_degree; i++) {
       uint64_t pf_address = (cl_addr + (trackers_l1[index].last_stride * (i + 1))) << LOG2_BLOCK_SIZE;
 
@@ -314,12 +347,19 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
         break;
       }
 
-      metadata = encode_metadata(trackers_l1[index].last_stride, CS_TYPE, spec_nl);
-      prefetch_line(champsim::address{pf_address}, true, metadata);
+      // metadata = encode_metadata(trackers_l1[index].last_stride, CS_TYPE, spec_nl);
+      pf_cs_lc++;
+      if(prefetch_line(champsim::address{pf_address}, true, 3)){
+        pf_cs++;
+      } 
+      // else {
+        // prefetch_line(champsim::address{pf_address}, false, 3);
+      // }
       num_prefs++;
       SIG_DP(cout << trackers_l1[cpu][index].last_stride << ", ");
     }
-  } else if (DPT_l1[signature].conf >= 0 && DPT_l1[signature].delta != 0) { // if conf>=0, continue looking for delta
+  } 
+   if (DPT_l1[signature].conf >= 0 && DPT_l1[signature].delta != 0) { // if conf>=0, continue looking for delta
     int pref_offset = 0, i = 0;                                             // CPLX IP
     for (i = 0; i < prefetch_degree; i++) {
       pref_offset += DPT_l1[signature].delta;
@@ -332,9 +372,15 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       }
 
       // we are not prefetching at L2 for CPLX type, so encode delta as 0
-      metadata = encode_metadata(0, CPLX_TYPE, spec_nl);
+      // metadata = encode_metadata(0, CPLX_TYPE, spec_nl);
       if (DPT_l1[signature].conf > 0) { // prefetch only when conf>0 for CPLX
-        prefetch_line(champsim::address{pf_address}, true, metadata);
+        pf_cplx_lc++;
+        if(prefetch_line(champsim::address{pf_address}, true, 4)){
+          pf_cplx++;
+        }
+        // else {
+        //   prefetch_line(champsim::address{pf_address}, false, 4);
+        // }
         num_prefs++;
         SIG_DP(cout << pref_offset << ", ");
       }
@@ -374,5 +420,51 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
 uint32_t ipcp::prefetcher_cache_fill(champsim::address addr, long set, long way, uint8_t prefetch, champsim::address evicted_addr, uint32_t metadata_in)
 {
+  auto ways = this->intern_->get_way(addr.to<uint64_t>(), set);
+  this->intern_->'';
+  if(prefetch){
+    // std::cout<< "[FILL]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Evicted :" << evicted_addr << std::endl;
+
+    switch (metadata_in)
+    {
+    case IPCP_CLASSES::NL:
+      pf_nl_fill++;
+      break;
+    case IPCP_CLASSES::GS:
+      pf_gs_fill++;
+      break;
+    case IPCP_CLASSES::CS:
+      pf_cs_fill++;
+      break;
+    case IPCP_CLASSES::CPLX:
+      pf_cplx_fill++;
+      break;
+    default:
+      // pf_default_fill++;
+      break;
+    }
+  }
   return metadata_in;
+}
+
+void ipcp::prefetcher_final_stats(){
+  using namespace std;
+  cout<<"*** Final Statistics ***" <<endl;
+
+  cout<< "PF NL LC :" << pf_nl_lc << endl;
+  cout<< "PF GS LC :" << pf_gs_lc << endl;
+  cout<< "PF CS LC :" << pf_cs_lc << endl;
+  cout<< "PF CPLX LC :" << pf_cplx_lc << endl;
+
+  cout<< "PR NL :" << pf_nl << endl;
+  cout<< "PR GS :" << pf_gs << endl;
+  cout<< "PR CS :" << pf_cs << endl;
+  cout<< "PR CPLX :" << pf_cplx << endl;
+
+  cout<< "PF NL :" << pf_nl_fill << endl;
+  cout<< "PF GS :" << pf_gs_fill << endl;
+  cout<< "PF CS :" << pf_cs_fill << endl;
+  cout<< "PF CPLX :" << pf_cplx_fill << endl;
+
+  cout<<"*************************" <<endl;
 }

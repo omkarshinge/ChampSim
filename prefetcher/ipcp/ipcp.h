@@ -15,7 +15,7 @@ struct ipcp : public champsim::modules::prefetcher {
   // void prefetcher_initialize();
   // void prefetcher_branch_operate(champsim::address ip, uint8_t branch_type, champsim::address branch_target) {}
   // void prefetcher_cycle_operate() {}
-  // void prefetcher_final_stats() {}
+  void prefetcher_final_stats();
 };
 
 #endif
