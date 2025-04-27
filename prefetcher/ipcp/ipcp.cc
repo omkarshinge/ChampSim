@@ -11,9 +11,9 @@ Biswabandan Panda - biswap@cse.iitk.ac.in
 
 #include "ipcp.h"
 
-#include "cache.h"
-#include <iostream>
 #include <access_type.h>
+#include <iostream>
+#include "cache.h"
 
 #define NUM_IP_TABLE_L1_ENTRIES 1024 // IP table entries
 #define NUM_GHB_ENTRIES 16           // Entries in the GHB
@@ -31,12 +31,96 @@ Biswabandan Panda - biswap@cse.iitk.ac.in
 #define SIG_DP(x)
 #endif
 
-enum IPCP_CLASSES {
-  NL = 1,
-  GS,
-  CS,
-  CPLX
+enum IPCP_CLASSES { NL = 1, GS, CS, CPLX, SEQ };
+
+// Custom hash function for std::pair (no Boost needed)
+struct pair_hash {
+  template <class T1, class T2>
+  std::size_t operator()(const std::pair<T1, T2>& p) const
+  {
+    auto h1 = std::hash<T1>{}(p.first);
+    auto h2 = std::hash<T2>{}(p.second);
+    return h1 ^ (h2 << 1);
+  }
 };
+
+class SequiturPredictor
+{
+public:
+  struct Rule {
+    std::vector<int64_t> sequence;
+  };
+
+  std::vector<int64_t> history_buffer;
+  std::unordered_map<std::pair<int64_t, int64_t>, int, pair_hash> digram_count;
+  std::unordered_map<uint64_t, Rule> grammar_rules;
+
+  void feed_delta(int64_t delta)
+  {
+    history_buffer.push_back(delta);
+
+    // Limit history buffer to 64 entries
+    if (history_buffer.size() > 64) {
+      history_buffer.erase(history_buffer.begin());
+    }
+
+    if (history_buffer.size() >= 2) {
+      auto pair = std::make_pair(history_buffer[history_buffer.size() - 2], history_buffer.back());
+      digram_count[pair]++;
+
+      // If digram_count becomes too large, clear it
+      if (digram_count.size() > 256) {
+        digram_count.clear(); // simple reset
+      }
+
+      if (digram_count[pair] > 2) {
+        grammar_rules[dhash(pair)] = {{pair.first, pair.second}};
+      }
+    }
+  }
+
+  std::vector<int64_t> predict_next() {
+    if (history_buffer.empty()) return {};
+
+    const int MAX_CHAIN_LENGTH = 4; // Limit maximum prefetch chain steps
+    int64_t current_delta = history_buffer.back();
+    std::vector<int64_t> predictions;
+    int chain_steps = 0;
+
+    while (chain_steps < MAX_CHAIN_LENGTH) {
+        std::vector<int64_t> best_sequence;
+        size_t best_length = 0;
+
+        // Find the best matching rule starting with current_delta
+        for (auto& rule : grammar_rules) {
+            if (!rule.second.sequence.empty() && rule.second.sequence.front() == current_delta) {
+                if (rule.second.sequence.size() > best_length) {
+                    best_sequence = rule.second.sequence;
+                    best_length = rule.second.sequence.size();
+                }
+            }
+        }
+
+        // If no matching rule found, stop chaining
+        if (best_sequence.empty()) {
+            break;
+        }
+
+        // Append predicted deltas (excluding first element which matched current_delta)
+        for (size_t i = 1; i < best_sequence.size() && chain_steps < MAX_CHAIN_LENGTH; ++i) {
+            predictions.push_back(best_sequence[i]);
+            current_delta = best_sequence[i];
+            chain_steps++;
+        }
+    }
+
+    return predictions;
+}
+
+private:
+  uint64_t dhash(const std::pair<int64_t, int64_t>& p) const { return ((uint64_t)p.first << 32) | (uint64_t)p.second; }
+};
+
 class IP_TABLE_L1
 {
 public:
@@ -82,17 +166,19 @@ public:
 IP_TABLE_L1 trackers_l1[NUM_IP_TABLE_L1_ENTRIES];
 DELTA_PRED_TABLE DPT_l1[4096];
 uint64_t ghb_l1[NUM_GHB_ENTRIES];
+
+SequiturPredictor sequitur_predictor;
 uint64_t prev_cpu_cycle;
 uint64_t num_misses;
 float mpkc = {0};
 // int spec_nl = {0};
 
-int pf_cs = 0, pf_nl = 0, pf_gs = 0, pf_cplx = 0;
-int pf_cs_successful = 0, pf_nl_successful = 0, pf_gs_successful = 0, pf_cplx_successful = 0;
+int pf_cs = 0, pf_nl = 0, pf_gs = 0, pf_cplx = 0, pf_seq = 0;
+int pf_cs_useful = 0, pf_nl_useful = 0, pf_gs_useful = 0, pf_cplx_useful = 0, pf_seq_useful = 0;
+int pf_cs_not_useful = 0, pf_nl_not_useful = 0, pf_gs_not_useful = 0, pf_cplx_not_useful = 0, pf_seq_not_useful = 0;
 int pf_cs_hit = 0, pf_nl_hit = 0, pf_gs_hit = 0, pf_cplx_hit = 0;
-int pf_cs_fill = 0, pf_nl_fill = 0, pf_gs_fill = 0, pf_cplx_fill = 0, pf_default_fill = 0;
-int pf_cs_lc = 0, pf_nl_lc = 0, pf_gs_lc = 0, pf_cplx_lc = 0;
-
+int pf_cs_fill = 0, pf_nl_fill = 0, pf_gs_fill = 0, pf_cplx_fill = 0, pf_seq_fill = 0, pf_default_fill = 0;
+int pf_cs_lc = 0, pf_nl_lc = 0, pf_gs_lc = 0, pf_cplx_lc = 0, pf_seq_lc = 0;
 
 /***************Updating the signature*************************************/
 uint16_t update_sig_l1(uint16_t old_sig, int delta)
@@ -128,18 +214,34 @@ uint32_t encode_metadata(int stride, uint16_t type, int spec_nl)
   return metadata;
 }
 
-/*********************Checking for a global stream (GS class)***************/
+bool strided_buffer = false;
+uint64_t strided_buffer_stride = 0;
 
 void check_for_stream_l1(int index, uint64_t cl_addr)
 {
   int pos_count = 0, neg_count = 0, count = 0;
   uint64_t check_addr = cl_addr;
+  uint64_t cc_time = 0;
+  strided_buffer = false;
+  int stride_count = 0;
+  int stride = check_addr - ghb_l1[0]; // First element's difference
+  for (int i = 1; i < NUM_GHB_ENTRIES; i++) {
+    if (abs(ghb_l1[i] - ghb_l1[i - 1]) == stride) {
+      stride_count++;
+    }
+  }
+  if (stride_count >= (NUM_GHB_ENTRIES * 3) / 4) {
+    // std::cout << " Strided Buffer detected" << std::endl;
+    strided_buffer = true;
+    strided_buffer_stride = stride;
+  }
 
   // check for +ve stream
   for (int i = 0; i < NUM_GHB_ENTRIES; i++) {
     check_addr--;
     for (int j = 0; j < NUM_GHB_ENTRIES; j++)
       if (check_addr == ghb_l1[j]) {
+        // cc_time -= ghb_l1_cc[j];
         pos_count++;
         break;
       }
@@ -190,13 +292,65 @@ int update_conf(int stride, int pred_stride, int conf)
   return conf;
 }
 
+uint64_t prev_stride = 0;
+
 uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::address ip, uint8_t cache_hit, bool useful_prefetch, access_type type,
                                         uint32_t metadata_in)
 {
   // if(useful_prefetch){
-  //   std::cout<< "[OPERATE]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Cache hit :" << (int)cache_hit << std::endl;
-  // } 
-  
+  //   std::cout<< "[OPERATE]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Cache hit :"
+  //   << (int)cache_hit << std::endl;
+  // }
+
+  uint64_t set = this->intern_->get_set(addr.to<uint64_t>());
+  uint64_t way = this->intern_->get_way(addr.to<uint64_t>(), set);
+  champsim::cache_block cache_block = this->intern_->block[set * way];
+
+  if (useful_prefetch && cache_block.pf_metadata != 0) {
+    std::cout << "[OPERATE]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << cache_block.pf_metadata
+              << "    Cache hit :" << (bool)cache_hit << "    Access Type:" << (int)type << std::endl;
+
+    switch (cache_block.pf_metadata) {
+    case IPCP_CLASSES::NL:
+      pf_nl_useful++;
+      break;
+    case IPCP_CLASSES::GS:
+      pf_gs_useful++;
+      break;
+    case IPCP_CLASSES::CS:
+      pf_cs_useful++;
+      break;
+    case IPCP_CLASSES::CPLX:
+      pf_cplx_useful++;
+      break;
+    case IPCP_CLASSES::SEQ:
+      pf_seq_useful++;
+      break;
+    default:
+      break;
+    }
+  } else if (!useful_prefetch && (cache_block.pf_metadata != 0)) {
+    switch (cache_block.pf_metadata) {
+    case IPCP_CLASSES::NL:
+      pf_nl_not_useful++;
+      break;
+    case IPCP_CLASSES::GS:
+      pf_gs_not_useful++;
+      break;
+    case IPCP_CLASSES::CS:
+      pf_cs_not_useful++;
+      break;
+    case IPCP_CLASSES::CPLX:
+      pf_cplx_not_useful++;
+      break;
+    case IPCP_CLASSES::SEQ:
+      pf_seq_not_useful++;
+      break;
+    default:
+      break;
+    }
+  }
+
   uint64_t curr_page = addr.to<uint64_t>() >> LOG2_PAGE_SIZE;
   uint64_t cl_addr = addr.to<uint64_t>() >> LOG2_BLOCK_SIZE;
   uint64_t cl_offset = (addr.to<uint64_t>() >> LOG2_BLOCK_SIZE) & 0x3F;
@@ -249,9 +403,9 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     uint64_t pf_address = ((addr.to<uint64_t>() >> LOG2_BLOCK_SIZE) + 1) << LOG2_BLOCK_SIZE; // BASE NL=1, changing it to 3
     // metadata = encode_metadata(1, NL_TYPE, spec_nl);
     pf_nl_lc++;
-    if(prefetch_line(champsim::address{pf_address}, true, 1)){
+    if (prefetch_line(champsim::address{pf_address}, true, 1)) {
       pf_nl++;
-    } 
+    }
     // else {
     //   prefetch_line(champsim::address{pf_address}, false, 1);
     // }
@@ -282,6 +436,10 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       stride -= 64;
   }
 
+  if (stride != 0) {
+    sequitur_predictor.feed_delta(stride);
+  }
+
   // update constant stride(CS) confidence
   trackers_l1[index].conf = update_conf(stride, trackers_l1[index].last_stride, trackers_l1[index].conf);
 
@@ -309,17 +467,29 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
          cout << trackers_l1[cpu][index].last_stride << ", " << stride << ", " << trackers_l1[cpu][index].conf << ", " << "; ";);
 
   if (trackers_l1[index].str_valid == 1) { // stream IP
-                                           // for stream, prefetch with twice the usual degree
-    prefetch_degree = prefetch_degree * 2;
-    for (int i = 0; i < prefetch_degree; i++) {
-      uint64_t pf_address = 0;
+    // for stream, prefetch with twice the usual degree
 
-      if (trackers_l1[index].str_dir == 1) { // +ve stream
-        pf_address = (cl_addr + i + 1) << LOG2_BLOCK_SIZE;
-        // metadata = encode_metadata(1, S_TYPE, spec_nl); // stride is 1
-      } else {                                          // -ve stream
-        pf_address = (cl_addr - i - 1) << LOG2_BLOCK_SIZE;
-        // metadata = encode_metadata(-1, S_TYPE, spec_nl); // stride is -1
+    if (strided_buffer) {
+      prefetch_degree = prefetch_degree * 3;
+    } else {
+      prefetch_degree = prefetch_degree * 2;
+    }
+    uint64_t pf_address;
+    for (int i = 0; i < prefetch_degree; i++) {
+      pf_address = 0;
+
+      if (strided_buffer) {
+        if (trackers_l1[index].str_dir == 1) { // +ve stream
+          pf_address = (cl_addr + i + strided_buffer_stride) << LOG2_BLOCK_SIZE;
+        } else { // -ve stream
+          pf_address = (cl_addr - i - strided_buffer_stride) << LOG2_BLOCK_SIZE;
+        }
+      } else {
+        if (trackers_l1[index].str_dir == 1) { // +ve stream
+          pf_address = (cl_addr + i + 1) << LOG2_BLOCK_SIZE;
+        } else { // -ve stream
+          pf_address = (cl_addr - i - 1) << LOG2_BLOCK_SIZE;
+        }
       }
 
       // Check if prefetch address is in same 4 KB page
@@ -327,9 +497,9 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
         break;
       }
       pf_gs_lc++;
-      if(prefetch_line(champsim::address{pf_address}, true, 2)){
+      if (prefetch_line(champsim::address{pf_address}, true, 2)) {
         pf_gs++;
-      } 
+      }
       // else {
       //   prefetch_line(champsim::address{pf_address}, false, 2);
       // }
@@ -337,7 +507,33 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       SIG_DP(cout << "1, ");
     }
 
-  } 
+    // if (strided_buffer) {
+    //   for (int i = 0; i < prefetch_degree; i++) {
+    //     // pf_address = 0;
+
+    //     if (trackers_l1[index].str_dir == 1) { // +ve stream
+    //       pf_address = (cl_addr + prefetch_degree + i + strided_buffer_stride) << LOG2_BLOCK_SIZE;
+    //     } else { // -ve stream
+    //       pf_address = (cl_addr - i - prefetch_degree - strided_buffer_stride) << LOG2_BLOCK_SIZE;
+    //     }
+
+    //     // Check if prefetch address is in same 4 KB page
+    //     if ((pf_address >> LOG2_PAGE_SIZE) != (addr.to<uint64_t>() >> LOG2_PAGE_SIZE)) {
+    //       break;
+    //     }
+    //     // pf_gs_lc++;
+    //     if (prefetch_line(champsim::address{pf_address}, false, 2)) {
+    //       // pf_gs++;
+    //     }
+    //     // else {
+    //     //   prefetch_line(champsim::address{pf_address}, false, 2);
+    //     // }
+    //     num_prefs++;
+    //   }
+    // }
+
+  }
+
   else if (trackers_l1[index].conf > 1 && trackers_l1[index].last_stride != 0) { // CS IP
     for (int i = 0; i < prefetch_degree; i++) {
       uint64_t pf_address = (cl_addr + (trackers_l1[index].last_stride * (i + 1))) << LOG2_BLOCK_SIZE;
@@ -349,18 +545,18 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
       // metadata = encode_metadata(trackers_l1[index].last_stride, CS_TYPE, spec_nl);
       pf_cs_lc++;
-      if(prefetch_line(champsim::address{pf_address}, true, 3)){
+      if (prefetch_line(champsim::address{pf_address}, true, 3)) {
         pf_cs++;
-      } 
+      }
       // else {
-        // prefetch_line(champsim::address{pf_address}, false, 3);
+      // prefetch_line(champsim::address{pf_address}, false, 3);
       // }
       num_prefs++;
       SIG_DP(cout << trackers_l1[cpu][index].last_stride << ", ");
     }
-  } 
-   if (DPT_l1[signature].conf >= 0 && DPT_l1[signature].delta != 0) { // if conf>=0, continue looking for delta
-    int pref_offset = 0, i = 0;                                             // CPLX IP
+  }
+  if (DPT_l1[signature].conf >= 0 && DPT_l1[signature].delta != 0) { // if conf>=0, continue looking for delta
+    int pref_offset = 0, i = 0;                                      // CPLX IP
     for (i = 0; i < prefetch_degree; i++) {
       pref_offset += DPT_l1[signature].delta;
       uint64_t pf_address = ((cl_addr + pref_offset) << LOG2_BLOCK_SIZE);
@@ -375,7 +571,7 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       // metadata = encode_metadata(0, CPLX_TYPE, spec_nl);
       if (DPT_l1[signature].conf > 0) { // prefetch only when conf>0 for CPLX
         pf_cplx_lc++;
-        if(prefetch_line(champsim::address{pf_address}, true, 4)){
+        if (prefetch_line(champsim::address{pf_address}, true, 4)) {
           pf_cplx++;
         }
         // else {
@@ -388,13 +584,31 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     }
   }
 
+  if (num_prefs == 0) { // Sequitur fallback before NL
+    std::vector<int64_t> preds = sequitur_predictor.predict_next();
+    for (auto delta : preds) {
+      uint64_t pf_address = (cl_addr + delta) << LOG2_BLOCK_SIZE;
+
+      // Check if prefetch address stays in same 4KB page
+      if ((pf_address >> LOG2_PAGE_SIZE) != (addr.to<uint64_t>() >> LOG2_PAGE_SIZE))
+        break;
+      pf_seq_lc++;
+      if (prefetch_line(champsim::address{pf_address}, true, 5)) {
+        // You can optionally add a counter pf_seq++ if you want
+        pf_seq++;
+        num_prefs++;
+      }
+    }
+  }
+
   // if no prefetches are issued till now, speculatively issue a next_line prefetch
-  // if(num_prefs == 0 && spec_nl[cpu] == 1){                                        // NL IP
-  //     uint64_t pf_address = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
-  //     metadata = encode_metadata(1, NL_TYPE, spec_nl[cpu]);
-  //     prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
-  //     SIG_DP(cout << "1, ");
-  // }
+  if (num_prefs == 0 && stride == 1) { // NL IP
+    uint64_t pf_address = ((addr.to<uint64_t>() >> LOG2_BLOCK_SIZE) + 1) << LOG2_BLOCK_SIZE;
+    pf_nl_lc++;
+    if (prefetch_line(pf_address, true, 1)) {
+      pf_nl++;
+    }
+  }
 
   SIG_DP(cout << endl);
 
@@ -410,8 +624,16 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       break;
   // only update the GHB upon finding a new cl address
   if (ghb_index == NUM_GHB_ENTRIES) {
-    for (ghb_index = NUM_GHB_ENTRIES - 1; ghb_index > 0; ghb_index--)
-      ghb_l1[ghb_index] = ghb_l1[ghb_index - 1];
+    uint64_t lstride = abs(cl_addr - ghb_l1[0]);
+    if (strided_buffer_stride == lstride && strided_buffer) {
+      for (int i = 0; i < NUM_GHB_ENTRIES; i++) {
+        ghb_l1[i] = 0;
+      }
+      strided_buffer = false;
+    } else {
+      for (ghb_index = NUM_GHB_ENTRIES - 1; ghb_index > 0; ghb_index--)
+        ghb_l1[ghb_index] = ghb_l1[ghb_index - 1];
+    }
     ghb_l1[0] = cl_addr;
   }
 
@@ -421,12 +643,12 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 uint32_t ipcp::prefetcher_cache_fill(champsim::address addr, long set, long way, uint8_t prefetch, champsim::address evicted_addr, uint32_t metadata_in)
 {
   auto ways = this->intern_->get_way(addr.to<uint64_t>(), set);
-  this->intern_->'';
-  if(prefetch){
-    // std::cout<< "[FILL]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Evicted :" << evicted_addr << std::endl;
+  // this->intern_->'';
+  if (prefetch) {
+    // std::cout<< "[FILL]Cache :" << this->intern_->sim_stats.name << "     Address :" << addr << "    Metadata :" << (int)metadata_in << "    Evicted :" <<
+    // evicted_addr << std::endl;
 
-    switch (metadata_in)
-    {
+    switch (metadata_in) {
     case IPCP_CLASSES::NL:
       pf_nl_fill++;
       break;
@@ -439,6 +661,9 @@ uint32_t ipcp::prefetcher_cache_fill(champsim::address addr, long set, long way,
     case IPCP_CLASSES::CPLX:
       pf_cplx_fill++;
       break;
+    case IPCP_CLASSES::SEQ:
+      pf_seq_fill++;
+      break;
     default:
       // pf_default_fill++;
       break;
@@ -447,24 +672,52 @@ uint32_t ipcp::prefetcher_cache_fill(champsim::address addr, long set, long way,
   return metadata_in;
 }
 
-void ipcp::prefetcher_final_stats(){
+void ipcp::prefetcher_final_stats()
+{
   using namespace std;
-  cout<<"*** Final Statistics ***" <<endl;
+  cout << "*** Final Statistics ***" << endl;
 
-  cout<< "PF NL LC :" << pf_nl_lc << endl;
-  cout<< "PF GS LC :" << pf_gs_lc << endl;
-  cout<< "PF CS LC :" << pf_cs_lc << endl;
-  cout<< "PF CPLX LC :" << pf_cplx_lc << endl;
+  // cout << "PF NL LC :" << pf_nl_lc << endl;
+  // cout << "PF GS LC :" << pf_gs_lc << endl;
+  // cout << "PF CS LC :" << pf_cs_lc << endl;
+  // cout << "PF CPLX LC :" << pf_cplx_lc << endl;
+  cout << "*** PF Requested ***" << endl;
 
-  cout<< "PR NL :" << pf_nl << endl;
-  cout<< "PR GS :" << pf_gs << endl;
-  cout<< "PR CS :" << pf_cs << endl;
-  cout<< "PR CPLX :" << pf_cplx << endl;
+  cout << "NL :" << pf_nl << endl;
+  cout << "GS :" << pf_gs << endl;
+  cout << "CS :" << pf_cs << endl;
+  cout << "CPLX :" << pf_cplx << endl;
+  cout << "SEQ :" << pf_seq << endl;
 
-  cout<< "PF NL :" << pf_nl_fill << endl;
-  cout<< "PF GS :" << pf_gs_fill << endl;
-  cout<< "PF CS :" << pf_cs_fill << endl;
-  cout<< "PF CPLX :" << pf_cplx_fill << endl;
 
-  cout<<"*************************" <<endl;
+  cout << "*** PF Filled ***" << endl;
+
+  cout << "NL :" << pf_nl_fill << endl;
+  cout << "GS :" << pf_gs_fill << endl;
+  cout << "CS :" << pf_cs_fill << endl;
+  cout << "CPLX :" << pf_cplx_fill << endl;
+  cout << "SEQ :" << pf_cplx_fill << endl;
+
+  cout << "*** Useful ***" << endl;
+  cout << "NL:" << pf_nl_useful << endl;
+  cout << "GS :" << pf_gs_useful << endl;
+  cout << "CS :" << pf_cs_useful << endl;
+  cout << "CPLX :" << pf_cplx_useful << endl;
+  cout << "SEQ :" << pf_seq_useful << endl;
+
+  cout << "*** Not Useful ***" << endl;
+  cout << "NL:" << pf_nl_not_useful << endl;
+  cout << "GS :" << pf_gs_not_useful << endl;
+  cout << "CS :" << pf_cs_not_useful << endl;
+  cout << "CPLX :" << pf_cplx_not_useful << endl;
+  cout << "SEQ :" << pf_seq_not_useful << endl;
+
+  cout << "*** Usefulness percentage ***" << endl;
+  cout << "NL:" << pf_nl_useful / pf_nl_not_useful << endl;
+  cout << "GS :" << pf_gs_useful / pf_gs_not_useful << endl;
+  cout << "CS :" << pf_cs_useful / pf_cs_not_useful << endl;
+  cout << "CPLX :" << pf_cplx_useful / pf_cplx_not_useful << endl;
+  cout << "SEQ :" << pf_seq_useful / pf_seq_not_useful << endl;
+
+  cout << "*************************" << endl;
 }
