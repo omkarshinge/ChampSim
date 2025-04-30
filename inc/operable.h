@@ -27,7 +27,7 @@ public:
   champsim::chrono::picoseconds clock_period{};
   champsim::chrono::clock::time_point current_time{};
   bool warmup = true;
-
+  long long num_retired = 0;
   operable();
   virtual ~operable() = default;
   explicit operable(champsim::chrono::picoseconds clock_period);

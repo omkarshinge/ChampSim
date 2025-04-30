@@ -86,6 +86,7 @@ class CACHE : public champsim::operable
 
 public:
   struct mshr_type {
+    int late_pref = 0;
     champsim::address address;
     champsim::address v_address;
     champsim::address ip;
@@ -111,6 +112,8 @@ public:
     mshr_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued);
     static mshr_type merge(mshr_type predecessor, mshr_type successor);
   };
+
+  uint64_t pref_useful[6], pref_filled[6], pref_late[6], late_prefetch;
 
 private:
   bool try_hit(const tag_lookup_type& handle_pkt);

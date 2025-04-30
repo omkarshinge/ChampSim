@@ -55,6 +55,9 @@ long do_cycle(environment& env, std::vector<tracereader>& traces, std::vector<st
     for (auto pkt_count = cpu.IN_QUEUE_SIZE - static_cast<long>(std::size(cpu.input_queue)); !trace.eof() && pkt_count > 0; --pkt_count) {
       cpu.input_queue.push_back(trace());
     }
+    for (champsim::operable& op : operables) {
+      op.num_retired = cpu.num_retired;
+    }
   }
 
   return progress;

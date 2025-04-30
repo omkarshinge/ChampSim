@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
 #include <fmt/core.h>
 
@@ -31,6 +32,9 @@
 #include "util/algorithm.h"
 #include "util/bits.h"
 #include "util/span.h"
+
+#define PREF_CLASS_MASK 0xF00 // 0x1E000	//IPCP pref class
+#define NUM_OF_STRIDE_BITS 8  // 13	//IPCP stride
 
 CACHE::CACHE(CACHE&& other)
     : operable(other),
@@ -148,7 +152,7 @@ auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
   to_fill.v_address = mshr.v_address;
   to_fill.data = mshr.data_promise->data;
   to_fill.pf_metadata = metadata;
-
+  to_fill.pref_class = ((metadata & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS);
   return to_fill;
 }
 
@@ -228,7 +232,18 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
     }
 
     if (fill_mshr.type == access_type::PREFETCH) {
+      if (((metadata_thru & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS) < 5) {
+        pref_filled[((metadata_thru & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS)]++;
+      }
       ++sim_stats.pf_fill;
+    }
+    // std::cout << " Late Pref :" << fill_mshr.late_pref << "        Metadata :" << ((metadata_thru & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS) << std::endl;
+    if (fill_mshr.late_pref == 1) {
+
+      int temp_pf_class = (metadata_thru & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS;
+      if (temp_pf_class < 5) {
+        pref_late[(metadata_thru & PREF_CLASS_MASK) >> NUM_OF_STRIDE_BITS]++;
+      }
     }
 
     *way = fill_block(fill_mshr, metadata_thru);
@@ -287,6 +302,9 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     if (useful_prefetch) {
       ++sim_stats.pf_useful;
       way->prefetch = false;
+      if (way->pref_class < 5) {
+        pref_useful[way->pref_class]++;
+      }
     }
   }
 
@@ -342,6 +360,8 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       if (mshr_entry->prefetch_from_this) {
         ++sim_stats.pf_useful;
       }
+      to_allocate.late_pref = 1;
+      late_prefetch++;
     }
 
     // COLLECT STATS
