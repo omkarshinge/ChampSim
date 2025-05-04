@@ -19,6 +19,7 @@ storage for various hardware tables.
 #include "ipcp.h"
 
 #include <iostream>
+#include <random>
 #include <vector>
 
 #include "cache.h"
@@ -245,41 +246,75 @@ bool enable_seq, enable_rctp, enable_gs, enable_cs, enable_cplx, enable_nl;
 
 class PrefetcherQLearningController
 {
-public:
-  static constexpr int NUM_MSHR_BINS = 2;
-  static constexpr int NUM_PFQ_BINS = 2;
-  static constexpr int NUM_USEFULNESS_BINS = 2;
-  static constexpr int NUM_STATES = NUM_MSHR_BINS * NUM_PFQ_BINS * NUM_USEFULNESS_BINS; // 8 states
 
-  static constexpr int NUM_ACTIONS = 16; // 16 smart actions as defined earlier
+public:
+  static constexpr int NUM_MSHR_BINS = 3;
+  static constexpr int NUM_PFQ_BINS = 3;
+  static constexpr int NUM_USE_CS_BINS = 2;
+  static constexpr int NUM_USE_GS_BINS = 2;
+  static constexpr int NUM_USE_NL_BINS = 2;
+  static constexpr int NUM_USE_CPLX_BINS = 2;
+
+  static constexpr int NUM_STATES = NUM_MSHR_BINS * NUM_PFQ_BINS * NUM_USE_CS_BINS * NUM_USE_GS_BINS * NUM_USE_NL_BINS * NUM_USE_CPLX_BINS; // 144 states
+  static constexpr int NUM_ACTIONS = 32;
 
   int8_t Q[NUM_STATES][NUM_ACTIONS];
 
-  const float alpha = 0.2f; // learning rate
-  const float gamma = 0.9f; // discount factor
-  float epsilon = 1.0f;     // exploration rate (can decay over time)
+  const float alpha = 0.2f;
+  const float gamma = 0.9f;
+  float epsilon = 1.0f;
 
   PrefetcherQLearningController()
   {
     for (int s = 0; s < NUM_STATES; ++s) {
       for (int a = 0; a < NUM_ACTIONS; ++a) {
-        Q[s][a] = 10; // Warm start Q-table with positive bias
+        Q[s][a] = 10;
       }
     }
   }
 
-  int quantize_mshr(float mshr_ratio) { return (mshr_ratio < 0.5f) ? 0 : 1; }
+  int quantize_mshr(float mshr_ratio)
+  {
+    if (mshr_ratio < 0.4f)
+      return 0;
+    else if (mshr_ratio < 0.75f)
+      return 1;
+    else
+      return 2;
+  }
 
-  int quantize_pfq(float pfq_ratio) { return (pfq_ratio < 0.5f) ? 0 : 1; }
+  int quantize_pfq(float pfq_ratio)
+  {
+    if (pfq_ratio < 0.4f)
+      return 0;
+    else if (pfq_ratio < 0.75f)
+      return 1;
+    else
+      return 2;
+  }
 
-  int quantize_usefulness(float usefulness_ratio) { return (usefulness_ratio < 0.5f) ? 0 : 1; }
+  int quantize_usefulness_class(int useful, int not_useful)
+  {
+    int total = useful + not_useful;
+    if (total == 0)
+      return 0;
+    return (useful * 100 / total >= 25) ? 1 : 0;
+  }
 
-  int get_state_index(int mshr_bin, int pfq_bin, int usefulness_bin) { return (mshr_bin << 2) | (pfq_bin << 1) | usefulness_bin; }
+  int quantize_usefulness_cs() { return quantize_usefulness_class(pf_cs_useful, pf_cs_not_useful); }
+  int quantize_usefulness_gs() { return quantize_usefulness_class(pf_gs_useful, pf_gs_not_useful); }
+  int quantize_usefulness_nl() { return quantize_usefulness_class(pf_nl_useful, pf_nl_not_useful); }
+  int quantize_usefulness_cplx() { return quantize_usefulness_class(pf_cplx_useful, pf_cplx_not_useful); }
+
+  int get_state_index(int mshr_bin, int pfq_bin, int cs_bin, int gs_bin, int nl_bin, int cplx_bin)
+  {
+    return (((((mshr_bin * NUM_PFQ_BINS + pfq_bin) * NUM_USE_CS_BINS + cs_bin) * NUM_USE_GS_BINS + gs_bin) * NUM_USE_NL_BINS + nl_bin) * NUM_USE_CPLX_BINS
+            + cplx_bin);
+  }
 
   int select_action(int state)
   {
     if ((float)(rand() % 100) / 100.0f < epsilon) {
-      // Biased exploration: prefer aggressive actions (action_id 8-15)
       return (rand() % 8) + 8;
     } else {
       int best_action = 0;
@@ -298,30 +333,22 @@ public:
   {
     int8_t max_future_q = *std::max_element(Q[new_state], Q[new_state] + NUM_ACTIONS);
     int8_t current_q = Q[old_state][action];
-
-    // Scale reward appropriately (softened reward)
     int scaled_reward = static_cast<int>(reward * 127.0f);
 
     int update = static_cast<int>(current_q + alpha * (scaled_reward + gamma * max_future_q - current_q));
-
-    // Clip to int8_t range
-    if (update > 127)
-      update = 127;
-    if (update < -128)
-      update = -128;
-
+    update = std::clamp(update, -128, 127);
     Q[old_state][action] = static_cast<int8_t>(update);
   }
 
-  // Helper for calculating soft reward
   float calculate_reward(int useful_prefetches, int not_useful_prefetches)
   {
     int total = useful_prefetches + not_useful_prefetches;
     if (total == 0)
       return 0.0f;
-    return static_cast<float>((useful_prefetches) + 10) / (total + 10); // soft reward with +10 stabilizer
+    return static_cast<float>((useful_prefetches) + 10) / (total + 10);
   }
 };
+
 uint64_t last_decision_cycle = 0;
 const uint64_t decision_interval = 10000; // every 10K cycles
 
@@ -360,24 +387,72 @@ PrefetchAction decode_action(int action_id)
   //                                         {0, 0, 1, 1, 2, 3}, {1, 2, 2, 2, 1, 1}, {1, 3, 3, 0, 2, 2}, {0, 1, 0, 1, 3, 2},
   //                                         {2, 2, 2, 2, 1, 1}, {3, 1, 0, 1, 1, 3}, {1, 0, 0, 0, 1, 3}, {3, 0, 0, 0, 0, 2}};
 
-  const int action_table[16][6] = {
-      // NL, GS, CS, CPLX, SEQ, RCTP
-      {0, 0, 0, 0, 0, 0}, // Action 0: Everything OFF
-      {1, 1, 1, 0, 0, 0}, // Action 1: Light NL+GS+CS
-      {2, 2, 2, 0, 0, 0}, // Action 2: Medium NL+GS+CS
-      {3, 3, 3, 0, 0, 0}, // Action 3: Heavy NL+GS+CS
-      {1, 0, 0, 1, 0, 0}, // Action 4: Light NL + CPLX
-      {2, 0, 0, 2, 0, 0}, // Action 5: Medium NL + CPLX
-      {0, 1, 0, 1, 0, 0}, // Action 6: Light GS + CPLX
-      {0, 2, 1, 2, 0, 0}, // Action 7: Medium GS + CS + CPLX
-      {1, 1, 2, 0, 0, 0}, // Action 8: NL + GS + stronger CS
-      {1, 2, 2, 0, 0, 0}, // Action 9: NL + strong GS + CS
-      {2, 2, 1, 1, 0, 0}, // Action 10: balanced NL+GS, weaker CPLX
-      {1, 3, 0, 1, 0, 0}, // Action 11: light NL + aggressive GS + CPLX
-      {2, 1, 2, 0, 0, 0}, // Action 12: stronger CS with moderate NL/GS
-      {3, 1, 1, 0, 0, 0}, // Action 13: heavy NL, light GS
-      {1, 0, 2, 0, 0, 0}, // Action 14: NL + strong CS
-      {3, 0, 1, 0, 0, 0}  // Action 15: heavy NL + light CS
+  // const int action_table[16][6] = {
+  //     // NL, GS, CS, CPLX, SEQ, RCTP
+  //     {0, 0, 0, 0, 0, 0}, // Action 0: Everything OFF
+  //     {1, 1, 1, 0, 0, 0}, // Action 1: Light NL+GS+CS
+  //     {2, 2, 2, 0, 0, 0}, // Action 2: Medium NL+GS+CS
+  //     {3, 3, 3, 0, 0, 0}, // Action 3: Heavy NL+GS+CS
+  //     {1, 0, 0, 1, 0, 0}, // Action 4: Light NL + CPLX
+  //     {2, 0, 0, 2, 0, 0}, // Action 5: Medium NL + CPLX
+  //     {0, 1, 0, 1, 0, 0}, // Action 6: Light GS + CPLX
+  //     {0, 2, 1, 2, 0, 0}, // Action 7: Medium GS + CS + CPLX
+  //     {1, 1, 2, 0, 0, 0}, // Action 8: NL + GS + stronger CS
+  //     {1, 2, 2, 0, 0, 0}, // Action 9: NL + strong GS + CS
+  //     {2, 2, 1, 1, 0, 0}, // Action 10: balanced NL+GS, weaker CPLX
+  //     {1, 3, 0, 1, 0, 0}, // Action 11: light NL + aggressive GS + CPLX
+  //     {2, 1, 2, 0, 0, 0}, // Action 12: stronger CS with moderate NL/GS
+  //     {3, 1, 1, 0, 0, 0}, // Action 13: heavy NL, light GS
+  //     {1, 0, 2, 0, 0, 0}, // Action 14: NL + strong CS
+  //     {3, 0, 1, 0, 0, 0}  // Action 15: heavy NL + light CS
+  // };
+
+  static const int action_table[32][6] = {
+      //  NL,  GS,  CS, CPLX, SEQ, RCTP
+      {0, 0, 0, 0, 0, 0}, // 0: all off
+      {1, 0, 0, 0, 0, 0}, // 1: light NL
+      {2, 0, 0, 0, 0, 0}, // 2: moderate NL
+      {3, 0, 0, 0, 0, 0}, // 3: aggressive NL
+
+      {0, 1, 0, 0, 0, 0}, // 4: light GS
+      {0, 2, 0, 0, 0, 0}, // 5: moderate GS
+      {0, 3, 0, 0, 0, 0}, // 6: aggressive GS
+
+      {0, 0, 1, 0, 0, 0}, // 7: light CS
+      {0, 0, 2, 0, 0, 0}, // 8: moderate CS
+      {0, 0, 3, 0, 0, 0}, // 9: aggressive CS
+
+      {0, 0, 0, 1, 0, 0}, // 10: light CPLX
+      {0, 0, 0, 2, 0, 0}, // 11: moderate CPLX
+      {0, 0, 0, 3, 0, 0}, // 12: aggressive CPLX
+
+      {1, 1, 0, 0, 0, 0}, // 13: NL+GS
+      {2, 2, 0, 0, 0, 0}, // 14: NL+GS stronger
+      {1, 1, 1, 0, 0, 0}, // 15: NL+GS+CS light
+
+      {2, 2, 2, 0, 0, 0}, // 16: NL+GS+CS medium
+      {3, 2, 1, 0, 0, 0}, // 17: NL+GS+CS heavy
+
+      {1, 0, 1, 1, 0, 0}, // 18: NL+CS+CPLX
+      {2, 0, 2, 2, 0, 0}, // 19: NL+CS+CPLX med
+      {0, 1, 1, 1, 0, 0}, // 20: GS+CS+CPLX
+
+      {1, 1, 1, 1, 0, 0}, // 21: all light
+      {2, 2, 2, 2, 0, 0}, // 22: all moderate
+      {3, 3, 3, 3, 0, 0}, // 23: all aggressive
+
+      {1, 2, 1, 0, 0, 0}, // 24: GS heavier
+      {2, 1, 2, 1, 0, 0}, // 25: CPLX lighter
+
+      {0, 2, 2, 1, 0, 0}, // 26: CS+GS+CPLX
+
+      {2, 1, 1, 2, 0, 0}, // 27: NL+CPLX med
+
+      {0, 0, 2, 2, 0, 0}, // 28: CS+CPLX only
+      {1, 0, 1, 2, 0, 0}, // 29: NL+CS+CPLX
+
+      {0, 2, 0, 2, 0, 0}, // 30: GS+CPLX only
+      {3, 0, 3, 0, 0, 0}  // 31: NL+CS high
   };
 
   PrefetchAction a;
@@ -762,6 +837,12 @@ void ipcp::prefetcher_initialize()
     rstable[i].lru = i;
 }
 
+void ipcp::prefetcher_branch_operate(champsim::address ip, uint8_t branch_type, champsim::address branch_target)
+{
+  std::cout << "[BRANCH OPERATE]Cache :" << this->intern_->sim_stats.name << "     IP :" << ip.to<uint64_t>() << "    branch type :" << branch_type
+            << "    branch target :" << branch_target << std::endl;
+}
+
 uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::address ip, uint8_t cache_hit, bool useful_prefetch, access_type type,
                                         uint32_t metadata_in)
 {
@@ -833,7 +914,7 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     }
   }
 
-  if (this->intern_->current_cycle() < 10000000) {
+  if (this->intern_->current_cycle() < 50000000) {
     ql_controller.epsilon = 1.0f; // Full random exploration
   } else {
     ql_controller.epsilon = 0.3f;
@@ -854,9 +935,12 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     // Step 1: Quantize current system state
     int mshr_bin = ql_controller.quantize_mshr(mshr_ratio);
     int pfq_bin = ql_controller.quantize_pfq(pfq_ratio);
-    int usefulness_bin = ql_controller.quantize_usefulness(usefulness_ratio);
+    int cs_bin = ql_controller.quantize_usefulness_cs();
+    int gs_bin = ql_controller.quantize_usefulness_gs();
+    int nl_bin = ql_controller.quantize_usefulness_nl();
+    int cplx_bin = ql_controller.quantize_usefulness_cplx();
 
-    int current_state = ql_controller.get_state_index(mshr_bin, pfq_bin, usefulness_bin);
+    int current_state = ql_controller.get_state_index(mshr_bin, pfq_bin, cs_bin, gs_bin, nl_bin, cplx_bin);
 
     // Step 2: Select action
     int action_id = ql_controller.select_action(current_state);
@@ -963,7 +1047,7 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
   if (num_misses % 256 == 0 && cache_hit == 0) {
 
-    mpki = ((num_misses * 1000.0) / (this->intern_->num_retired - 10000000));
+    mpki = ((num_misses * 1000.0) / (this->intern_->num_retired - 50000000));
 
     if (mpki > spec_nl_threshold)
       spec_nl = 0;
@@ -1489,7 +1573,7 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
    * Next Line
    *
    */
-  if (class_control_nl.enabled && num_prefs == 0 && spec_nl == 1) {
+  if (class_control_nl.enabled) {
     prefetch_degree = class_control_nl.prefetch_degree;
     if (flag_nl == 0)
       flag_nl = 1;
