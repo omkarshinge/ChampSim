@@ -61,6 +61,8 @@ vice versa in the cache's MSHR as, if the prefetch would've been on time, the de
 #define SIG_DP(x)
 #endif
 
+int warmup_complete = 0;
+
 enum IPCP_CLASSES { NL = 1, GS, CS, CPLX, SEQ, RCTP };
 
 /*
@@ -258,6 +260,10 @@ public:
   static constexpr int NUM_STATES = NUM_MSHR_BINS * NUM_PFQ_BINS * NUM_USE_CS_BINS * NUM_USE_GS_BINS * NUM_USE_NL_BINS * NUM_USE_CPLX_BINS; // 144 states
   static constexpr int NUM_ACTIONS = 32;
 
+  // NUM STATES * NUM ACTIONS = 144 * 32 = 4608
+  // If 1 byte each then 4608 Bytes
+
+
   int8_t Q[NUM_STATES][NUM_ACTIONS];
 
   const float alpha = 0.2f;
@@ -315,7 +321,11 @@ public:
   int select_action(int state)
   {
     if ((float)(rand() % 100) / 100.0f < epsilon) {
-      return (rand() % 8) + 8;
+      if(warmup_complete){
+        return rand() % 32;
+      } else {
+        return (rand() % 8) + 8;
+      }
     } else {
       int best_action = 0;
       int8_t best_q = Q[state][0];
@@ -837,11 +847,11 @@ void ipcp::prefetcher_initialize()
     rstable[i].lru = i;
 }
 
-void ipcp::prefetcher_branch_operate(champsim::address ip, uint8_t branch_type, champsim::address branch_target)
-{
-  std::cout << "[BRANCH OPERATE]Cache :" << this->intern_->sim_stats.name << "     IP :" << ip.to<uint64_t>() << "    branch type :" << branch_type
-            << "    branch target :" << branch_target << std::endl;
-}
+// void ipcp::prefetcher_branch_operate(champsim::address ip, uint8_t branch_type, champsim::address branch_target)
+// {
+//   std::cout << "[BRANCH OPERATE]Cache :" << this->intern_->sim_stats.name << "     IP :" << ip.to<uint64_t>() << "    branch type :" << branch_type
+//             << "    branch target :" << branch_target << std::endl;
+// }
 
 uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::address ip, uint8_t cache_hit, bool useful_prefetch, access_type type,
                                         uint32_t metadata_in)
@@ -916,8 +926,10 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
 
   if (this->intern_->current_cycle() < 50000000) {
     ql_controller.epsilon = 1.0f; // Full random exploration
+    // warmup_complete = 0;
   } else {
     ql_controller.epsilon = 0.3f;
+    warmup_complete = 1;
   }
 
   uint64_t mshr_ratio = this->intern_->get_mshr_occupancy_ratio();
