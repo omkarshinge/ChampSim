@@ -85,102 +85,6 @@ std::unordered_map<uint64_t, RegionEntry> region_table; // Map of region tag →
 // Distance Accuracy Table (DAT)
 std::unordered_map<int64_t, int> distance_accuracy_table; // region distance -> accuracy counter
 
-/*
- * Sequitur related structures
- *
- * */
-
-// Custom hash function for std::pair (no Boost needed)
-struct pair_hash {
-  template <class T1, class T2>
-  std::size_t operator()(const std::pair<T1, T2>& p) const
-  {
-    auto h1 = std::hash<T1>{}(p.first);
-    auto h2 = std::hash<T2>{}(p.second);
-    return h1 ^ (h2 << 1);
-  }
-};
-
-class SequiturPredictor
-{
-public:
-  struct Rule {
-    std::vector<int64_t> sequence;
-  };
-
-  std::vector<int64_t> history_buffer;
-  std::unordered_map<std::pair<int64_t, int64_t>, int, pair_hash> digram_count;
-  std::unordered_map<uint64_t, Rule> grammar_rules;
-
-  void feed_delta(int64_t delta)
-  {
-    history_buffer.push_back(delta);
-
-    // Limit history buffer to 64 entries
-    if (history_buffer.size() > 64) {
-      history_buffer.erase(history_buffer.begin());
-    }
-
-    if (history_buffer.size() >= 2) {
-      auto pair = std::make_pair(history_buffer[history_buffer.size() - 2], history_buffer.back());
-      digram_count[pair]++;
-
-      // If digram_count becomes too large, clear it
-      if (digram_count.size() > 256) {
-        digram_count.clear(); // simple reset
-      }
-
-      if (digram_count[pair] > 2) {
-        grammar_rules[dhash(pair)] = {{pair.first, pair.second}};
-      }
-    }
-  }
-
-  std::vector<int64_t> predict_next()
-  {
-    if (history_buffer.empty())
-      return {};
-
-    const int MAX_CHAIN_LENGTH = 4; // Limit maximum prefetch chain steps
-    int64_t current_delta = history_buffer.back();
-    std::vector<int64_t> predictions;
-    int chain_steps = 0;
-
-    while (chain_steps < MAX_CHAIN_LENGTH) {
-      std::vector<int64_t> best_sequence;
-      size_t best_length = 0;
-
-      // Find the best matching rule starting with current_delta
-      for (auto& rule : grammar_rules) {
-        if (!rule.second.sequence.empty() && rule.second.sequence.front() == current_delta) {
-          if (rule.second.sequence.size() > best_length) {
-            best_sequence = rule.second.sequence;
-            best_length = rule.second.sequence.size();
-          }
-        }
-      }
-
-      // If no matching rule found, stop chaining
-      if (best_sequence.empty()) {
-        break;
-      }
-
-      // Append predicted deltas (excluding first element which matched current_delta)
-      for (size_t i = 1; i < best_sequence.size() && chain_steps < MAX_CHAIN_LENGTH; ++i) {
-        predictions.push_back(best_sequence[i]);
-        current_delta = best_sequence[i];
-        chain_steps++;
-      }
-    }
-
-    return predictions;
-  }
-
-private:
-  uint64_t dhash(const std::pair<int64_t, int64_t>& p) const { return ((uint64_t)p.first << 32) | (uint64_t)p.second; }
-};
-
-SequiturPredictor sequitur_predictor;
 int pf_cs = 0, pf_nl = 0, pf_gs = 0, pf_cplx = 0, pf_seq = 0, pf_rctp = 0;
 int pf_cs_useful = 0, pf_nl_useful = 0, pf_gs_useful = 0, pf_cplx_useful = 0, pf_seq_useful = 0, pf_rctp_useful = 0;
 int pf_cs_not_useful = 0, pf_nl_not_useful = 0, pf_gs_not_useful = 0, pf_cplx_not_useful = 0, pf_seq_not_useful = 0, pf_rctp_not_useful = 0;
@@ -195,49 +99,6 @@ int conf_cplx = 0;
 int conf_seq = 0;
 int conf_rctp = 0;
 
-void update_class_confidences()
-{
-  if ((pf_nl_useful + 5) > pf_nl_not_useful)
-    conf_nl++;
-  else
-    conf_nl--;
-  if ((pf_gs_useful + 5) > pf_gs_not_useful)
-    conf_gs++;
-  else
-    conf_gs--;
-  if ((pf_cs_useful + 5) > pf_cs_not_useful)
-    conf_cs++;
-  else
-    conf_cs--;
-  if ((pf_cplx_useful + 5) > pf_cplx_not_useful)
-    conf_cplx++;
-  else
-    conf_cplx--;
-  if ((pf_seq_useful + 5) > pf_seq_not_useful)
-    conf_seq++;
-  else
-    conf_seq--;
-  if ((pf_rctp_useful + 5) > pf_rctp_not_useful)
-    conf_rctp++;
-  else
-    conf_rctp--;
-
-  // Clamp confidence within [-5, +5]
-  conf_nl = std::clamp(conf_nl, -5, 5);
-  conf_gs = std::clamp(conf_gs, -5, 5);
-  conf_cs = std::clamp(conf_cs, -5, 5);
-  conf_cplx = std::clamp(conf_cplx, -5, 5);
-  conf_seq = std::clamp(conf_seq, -5, 5);
-  conf_rctp = std::clamp(conf_rctp, -5, 5);
-
-  // Reset per-class useful and not-useful counters after update
-  pf_nl_useful = pf_nl_not_useful = 0;
-  pf_gs_useful = pf_gs_not_useful = 0;
-  pf_cs_useful = pf_cs_not_useful = 0;
-  pf_cplx_useful = pf_cplx_not_useful = 0;
-  pf_seq_useful = pf_seq_not_useful = 0;
-  pf_rctp_useful = pf_rctp_not_useful = 0;
-}
 /**
  *
  * Reinforcement Learning Q values based
@@ -259,10 +120,6 @@ public:
 
   static constexpr int NUM_STATES = NUM_MSHR_BINS * NUM_PFQ_BINS * NUM_USE_CS_BINS * NUM_USE_GS_BINS * NUM_USE_NL_BINS * NUM_USE_CPLX_BINS; // 144 states
   static constexpr int NUM_ACTIONS = 32;
-
-  // NUM STATES * NUM ACTIONS = 144 * 32 = 4608
-  // If 1 byte each then 4608 Bytes
-
 
   int8_t Q[NUM_STATES][NUM_ACTIONS];
 
@@ -321,7 +178,7 @@ public:
   int select_action(int state)
   {
     if ((float)(rand() % 100) / 100.0f < epsilon) {
-      if(warmup_complete){
+      if (warmup_complete) {
         return rand() % 32;
       } else {
         return (rand() % 8) + 8;
@@ -380,43 +237,15 @@ ClassControl class_control_nl;
 ClassControl class_control_gs;
 ClassControl class_control_cs;
 ClassControl class_control_cplx;
-ClassControl class_control_seq;
-ClassControl class_control_rctp;
+
 struct PrefetchAction {
   int action_nl;   // Next-Line prefetch control
   int action_gs;   // Global Stream prefetch control
   int action_cs;   // Constant Stride prefetch control
   int action_cplx; // Complex Stride prefetch control
-  int action_seq;  // Sequitur prefetch control
-  int action_rctp; // RCTP prefetch control
 };
 PrefetchAction decode_action(int action_id)
 {
-  // static const int action_table[16][6] = {{0, 0, 0, 0, 0, 0}, {1, 1, 1, 0, 0, 1}, {2, 2, 2, 0, 0, 2}, {3, 3, 3, 0, 0, 3},
-  //                                         {1, 0, 0, 0, 2, 2}, {2, 0, 0, 0, 3, 3}, {0, 1, 0, 0, 1, 1}, {0, 2, 1, 0, 2, 2},
-  //                                         {0, 0, 1, 1, 2, 3}, {1, 2, 2, 2, 1, 1}, {1, 3, 3, 0, 2, 2}, {0, 1, 0, 1, 3, 2},
-  //                                         {2, 2, 2, 2, 1, 1}, {3, 1, 0, 1, 1, 3}, {1, 0, 0, 0, 1, 3}, {3, 0, 0, 0, 0, 2}};
-
-  // const int action_table[16][6] = {
-  //     // NL, GS, CS, CPLX, SEQ, RCTP
-  //     {0, 0, 0, 0, 0, 0}, // Action 0: Everything OFF
-  //     {1, 1, 1, 0, 0, 0}, // Action 1: Light NL+GS+CS
-  //     {2, 2, 2, 0, 0, 0}, // Action 2: Medium NL+GS+CS
-  //     {3, 3, 3, 0, 0, 0}, // Action 3: Heavy NL+GS+CS
-  //     {1, 0, 0, 1, 0, 0}, // Action 4: Light NL + CPLX
-  //     {2, 0, 0, 2, 0, 0}, // Action 5: Medium NL + CPLX
-  //     {0, 1, 0, 1, 0, 0}, // Action 6: Light GS + CPLX
-  //     {0, 2, 1, 2, 0, 0}, // Action 7: Medium GS + CS + CPLX
-  //     {1, 1, 2, 0, 0, 0}, // Action 8: NL + GS + stronger CS
-  //     {1, 2, 2, 0, 0, 0}, // Action 9: NL + strong GS + CS
-  //     {2, 2, 1, 1, 0, 0}, // Action 10: balanced NL+GS, weaker CPLX
-  //     {1, 3, 0, 1, 0, 0}, // Action 11: light NL + aggressive GS + CPLX
-  //     {2, 1, 2, 0, 0, 0}, // Action 12: stronger CS with moderate NL/GS
-  //     {3, 1, 1, 0, 0, 0}, // Action 13: heavy NL, light GS
-  //     {1, 0, 2, 0, 0, 0}, // Action 14: NL + strong CS
-  //     {3, 0, 1, 0, 0, 0}  // Action 15: heavy NL + light CS
-  // };
-
   static const int action_table[32][6] = {
       //  NL,  GS,  CS, CPLX, SEQ, RCTP
       {0, 0, 0, 0, 0, 0}, // 0: all off
@@ -470,50 +299,7 @@ PrefetchAction decode_action(int action_id)
   a.action_gs = action_table[action_id][1];
   a.action_cs = action_table[action_id][2];
   a.action_cplx = action_table[action_id][3];
-  a.action_seq = action_table[action_id][4];
-  a.action_rctp = action_table[action_id][5];
   return a;
-}
-
-void apply_confidence_boost()
-{
-  // Boost degree by +1 if confidence is good (>= 2)
-  if (conf_nl >= 2 && class_control_nl.enabled)
-    class_control_nl.prefetch_degree = std::min(class_control_nl.prefetch_degree + 1, 3);
-
-  if (conf_gs >= 2 && class_control_gs.enabled)
-    class_control_gs.prefetch_degree = std::min(class_control_gs.prefetch_degree + 1, 3);
-
-  if (conf_cs >= 2 && class_control_cs.enabled)
-    class_control_cs.prefetch_degree = std::min(class_control_cs.prefetch_degree + 1, 3);
-
-  if (conf_cplx >= 2 && class_control_cplx.enabled)
-    class_control_cplx.prefetch_degree = std::min(class_control_cplx.prefetch_degree + 1, 3);
-
-  if (conf_seq >= 2 && class_control_seq.enabled)
-    class_control_seq.prefetch_degree = std::min(class_control_seq.prefetch_degree + 1, 3);
-
-  if (conf_rctp >= 2 && class_control_rctp.enabled)
-    class_control_rctp.prefetch_degree = std::min(class_control_rctp.prefetch_degree + 1, 3);
-
-  // Disable class if confidence is very bad (<= -3)
-  if (conf_nl <= -3)
-    class_control_nl.enabled = false;
-
-  if (conf_gs <= -3)
-    class_control_gs.enabled = false;
-
-  if (conf_cs <= -3)
-    class_control_cs.enabled = false;
-
-  if (conf_cplx <= -3)
-    class_control_cplx.enabled = false;
-
-  if (conf_seq <= -3)
-    class_control_seq.enabled = false;
-
-  if (conf_rctp <= -3)
-    class_control_rctp.enabled = false;
 }
 
 class IP_TABLE_L1
@@ -972,20 +758,6 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     class_control_cplx.prefetch_degree = prefetch_action.action_cplx;
     class_control_cplx.enabled = (prefetch_action.action_cplx != 0);
 
-    class_control_seq.prefetch_degree = prefetch_action.action_seq;
-    class_control_seq.enabled = (prefetch_action.action_seq != 0);
-
-    class_control_rctp.prefetch_degree = prefetch_action.action_rctp;
-    class_control_rctp.enabled = (prefetch_action.action_rctp != 0);
-
-    // class_control_rctp.prefetch_degree = 0;
-    // class_control_rctp.enabled = false;
-
-    // class_control_seq.prefetch_degree = 0;
-    // class_control_seq.enabled = false;
-
-    // Boost or disable based on class confidence
-    // apply_confidence_boost();
     // Step 4: Calculate reward
     float reward = ql_controller.calculate_reward(total_useful, total_not_useful);
 
@@ -995,16 +767,12 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     // Step 6: Update state tracking
     last_state = current_state;
     last_action = action_id;
-    // update_class_confidences();
 
     // // Step 7: Reset counters
     pf_nl_useful = pf_nl_not_useful = 0;
     pf_gs_useful = pf_gs_not_useful = 0;
     pf_cs_useful = pf_cs_not_useful = 0;
     pf_cplx_useful = pf_cplx_not_useful = 0;
-    pf_seq_useful = pf_seq_not_useful = 0;
-    pf_rctp_useful = pf_rctp_not_useful = 0;
-
     last_decision_cycle = current_core_cycle;
   }
 
@@ -1066,39 +834,6 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
     else
       spec_nl = 1;
   }
-
-  // Updating prefetch degree based on accuracy
-  // for (int i = 0; i < 5; i++) {
-  //   if (this->intern_->pref_filled[i] % 256 == 0) {
-
-  //     acc_useful[i] = acc_useful[i] / 2.0 + (this->intern_->pref_useful[i] - acc_useful[i]) / 2.0;
-  //     acc_filled[i] = acc_filled[i] / 2.0 + (this->intern_->pref_filled[i] - acc_filled[i]) / 2.0;
-
-  //     if (acc_filled[i] != 0)
-  //       acc[i] = 100.0 * acc_useful[i] / (acc_filled[i]);
-  //     else
-  //       acc[i] = 60;
-
-  //     if (acc[i] > 75) {
-  //       degree_incremented_times++;
-  //       prefetch_degree[i]++;
-  //       if (i == 1) {
-  //         // For GS class, degree is incremented/decremented by 2.
-  //         prefetch_degree[i]++;
-  //         if (prefetch_degree[i] > 6)
-  //           prefetch_degree[i] = 6;
-  //       } else if (prefetch_degree[i] > 3)
-  //         prefetch_degree[i] = 3;
-  //     } else if (acc[i] < 40) {
-  //       degree_decremented_times++;
-  //       prefetch_degree[i]--;
-  //       if (i == 1)
-  //         prefetch_degree[i]--;
-  //       if (prefetch_degree[i] < 1)
-  //         prefetch_degree[i] = 1;
-  //     }
-  //   }
-  // }
 
   // increment one access for tag read, it will be one+ for tag write too I guess?
   ip_table_tag_read_accesses++;
@@ -1266,10 +1001,6 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
       stride += NUM_OF_LINES_IN_REGION;
     else
       stride -= NUM_OF_LINES_IN_REGION;
-  }
-
-  if (stride != 0) {
-    sequitur_predictor.feed_delta(stride);
   }
 
   // Train Region Table
@@ -1497,86 +1228,6 @@ uint32_t ipcp::prefetcher_cache_operate(champsim::address addr, champsim::addres
         SIG_DP(cout << pref_offset << ", ");
       }
       signature = update_sig_l1(signature, CSPT_l1[signature].stride);
-    }
-  }
-
-  /**
-   *
-   * Sequitur
-   *
-   */
-  if (class_control_seq.enabled) { // Sequitur fallback before NL
-    prefetch_degree = class_control_seq.prefetch_degree;
-
-    std::vector<int64_t> preds = sequitur_predictor.predict_next();
-    int issued = 0; // Track how many prefetches issued
-
-    for (auto delta : preds) {
-      if (issued >= prefetch_degree)
-        break; // Limit by prefetch degree
-
-      uint64_t pf_address = (line_addr + delta) << LOG2_BLOCK_SIZE;
-
-      // Check if prefetch address stays in same 4KB page
-      if ((pf_address >> LOG2_PAGE_SIZE) != (addr.to<uint64_t>() >> LOG2_PAGE_SIZE))
-        break;
-
-      pf_seq_lc++;
-      if (prefetch_line(champsim::address{pf_address}, true, 5)) {
-        pf_seq++;
-        num_prefs++;
-      }
-
-      issued++; // Increment prefetch issued count
-    }
-  }
-
-  /**
-   *
-   * RCTP
-   *
-   */
-  if (class_control_rctp.enabled) { // RCTP enabled
-    uint64_t region_tag = addr.to<uint64_t>() >> 12;
-    uint64_t offset_in_region = addr.to<uint64_t>() & (RCTP_REGION_SIZE - 1);
-
-    bool found_prediction = false;
-
-    int max_rctp_prefetches = class_control_rctp.prefetch_degree; // 🛠 Apply degree control here
-
-    for (auto& entry : region_table) {
-      int64_t region_distance = static_cast<int64_t>(region_tag) - static_cast<int64_t>(entry.first);
-
-      if (distance_accuracy_table[region_distance] > 2) {
-        bool offset_matched = false;
-        for (auto off : entry.second.offsets) {
-          if (std::abs(static_cast<int64_t>(off) - static_cast<int64_t>(offset_in_region)) <= 8) {
-            offset_matched = true;
-            break;
-          }
-        }
-
-        if (offset_matched) {
-          int issued_rctp_pfs = 0;
-          for (auto delta : entry.second.deltas) {
-            if (issued_rctp_pfs >= max_rctp_prefetches) // 🛠 Stop when degree prefetched
-              break;
-
-            uint64_t pf_address = (line_addr + delta) << LOG2_BLOCK_SIZE;
-
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr.to<uint64_t>() >> LOG2_PAGE_SIZE))
-              break;
-
-            if (prefetch_line(champsim::address{pf_address}, true, 6)) {
-              num_prefs++;
-              issued_rctp_pfs++;
-            }
-          }
-          found_prediction = true;
-        }
-      }
-      if (found_prediction)
-        break;
     }
   }
 
