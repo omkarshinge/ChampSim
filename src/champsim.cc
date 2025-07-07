@@ -72,6 +72,7 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
   for (champsim::operable& op : operables) {
     op.warmup = is_warmup;
     op.begin_phase();
+    op.trace_file_names = trace_names;
   }
 
   const auto time_quantum = std::accumulate(std::cbegin(operables), std::cend(operables), champsim::chrono::clock::duration::max(),

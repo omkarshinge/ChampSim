@@ -24,6 +24,9 @@ storage for various hardware tables.
 
 #include "cache.h"
 #include "ipcp_table_sizes.h"
+#include <fstream>
+
+std::ofstream reward_log_file;
 
 /**************************************************************************************************************************
 Note that variables uint64_t pref_useful[6], pref_filled[6], pref_late[6]; are to be declared
@@ -178,11 +181,11 @@ public:
   int select_action(int state)
   {
     if ((float)(rand() % 100) / 100.0f < epsilon) {
-      if (warmup_complete) {
+      // if (warmup_complete) {
         return rand() % 32;
-      } else {
-        return (rand() % 8) + 8;
-      }
+      // } else {
+      //   return (rand() % 8) + 8;
+      // }
     } else {
       int best_action = 0;
       int8_t best_q = Q[state][0];
@@ -1481,4 +1484,25 @@ void ipcp::prefetcher_final_stats()
   // cout << "RCTP :" << pf_rctp_useful / pf_rctp_not_useful << endl;
 
   cout << "*************************" << endl;
+
+  std::string file_path = this->intern_->trace_file_names[0];
+  size_t pos = file_path.find_last_of("/\\");
+  std::string filename = (pos != std::string::npos) ? file_path.substr(pos + 1) : file_path;
+  // std::cout << "Filename: " << filename << std::endl;
+  reward_log_file.open(filename + ".csv");
+  if (!reward_log_file.is_open()) {
+      std::cerr << "Failed to open reward log file!" << std::endl;
+  }
+
+  if (reward_log_file.is_open()) {
+      reward_log_file << "State, Action, Q-Value\n";
+        for (int s = 0; s < ql_controller.NUM_STATES; ++s) {
+          for (int a = 0; a < ql_controller.NUM_ACTIONS; ++a) {
+            // ql_controller.Q[s][a];
+            reward_log_file << s << ", " << a << ", " << static_cast<int>(ql_controller.Q[s][a]) << "\n";
+          }
+        }
+
+      reward_log_file.close();
+  }
 }

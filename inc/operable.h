@@ -18,6 +18,8 @@
 #define OPERABLE_H
 
 #include "chrono.h"
+#include <vector>
+#include <string>
 
 namespace champsim
 {
@@ -28,6 +30,7 @@ public:
   champsim::chrono::clock::time_point current_time{};
   bool warmup = true;
   long long num_retired = 0;
+  std::vector<std::string> trace_file_names;
   operable();
   virtual ~operable() = default;
   explicit operable(champsim::chrono::picoseconds clock_period);
